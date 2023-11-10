@@ -1,12 +1,13 @@
 package kvraft
 
 import (
-	"6.5840/labgob"
-	"6.5840/labrpc"
-	"6.5840/raft"
 	"log"
 	"sync"
 	"sync/atomic"
+
+	"6.5840/labgob"
+	"6.5840/labrpc"
+	"6.5840/raft"
 )
 
 const Debug = false
@@ -18,11 +19,23 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Index int
+	Term  int
+	Name  string
+	Key   string
+	Value string
+}
+
+type OpContext struct {
+	op          Op
+	wrongLeader bool
+	keyExist    bool
+	value       string
+	notify      chan bool
 }
 
 type KVServer struct {
@@ -35,15 +48,181 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	dbMap map[string]string
+	opMap map[int]*OpContext
 }
-
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	DPrintf("Server: KVServer[%d] Get(%s)", kv.me, args.Key)
+	// Enter Get() in the Raft Log
+	newOp := Op{
+		Name:  "Get",
+		Key:   args.Key,
+		Value: "",
+	}
+	var isLeader bool
+	newOp.Index, newOp.Term, isLeader = kv.rf.Start(newOp)
+	DPrintf("Server: KVServer[%d] Get(%s) index = %d, term = %d, leader = %v", kv.me, args.Key, newOp.Index, newOp.Term, isLeader)
+	// Judge whether the current kvserver is leader
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	DPrintf("Server: KVServer[%d] Get(%s) Leader = %d", kv.me, args.Key, kv.rf.GetLeader())
+	// Update Op Context
+	newOpCtx := OpContext{
+		op:          newOp,
+		wrongLeader: false,
+		keyExist:    false,
+		value:       "",
+		notify:      make(chan bool),
+	}
+
+	func() {
+		kv.mu.Lock()
+		defer kv.mu.Unlock()
+		kv.opMap[newOp.Index] = &newOpCtx
+	}()
+
+	defer func() {
+		kv.mu.Lock()
+		defer kv.mu.Unlock()
+		delete(kv.opMap, newOp.Index)
+	}()
+
+	// Wait for the Raft Log to be committed
+	// or the Raft Leader to change
+	<-newOpCtx.notify
+	if newOpCtx.wrongLeader {
+		reply.Err = ErrWrongLeader
+		return
+	} else if newOpCtx.keyExist {
+		reply.Err = OK
+		reply.Value = newOpCtx.value
+		DPrintf("Server: KVServer[%d] Get(%s) = %s", kv.me, args.Key, reply.Value)
+		return
+	} else {
+		reply.Err = ErrNoKey
+		DPrintf("Server: KVServer[%d] Get(%s) = None", kv.me, args.Key)
+		return
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+
+	DPrintf("Server: KVServer[%d] PutAppend(%s, %s)", kv.me, args.Key, args.Value)
+	// Enter PutAppend() in the Raft Log
+	newOp := Op{
+		Name:  args.Op,
+		Key:   args.Key,
+		Value: "",
+	}
+	var isLeader bool
+	newOp.Index, newOp.Term, isLeader = kv.rf.Start(Op{
+		Name:  args.Op,
+		Key:   args.Key,
+		Value: args.Value,
+	})
+	DPrintf("Server: KVServer[%d] PutAppend(%s, %s) index = %d, term = %d leader = %v", kv.me, args.Key, args.Value, newOp.Term, newOp.Index, isLeader)
+	// Judge whether the current kvserver is leader
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	DPrintf("Server: KVServer[%d] PutAppend(%s, %s) Leader = %d", kv.me, args.Key, args.Value, kv.rf.GetLeader())
+	// Wait for the Raft Log to be committed
+	// or the Raft Leader to change
+	newOpCtx := OpContext{
+		op:          newOp,
+		wrongLeader: false,
+		notify:      make(chan bool),
+		keyExist:    false,
+		value:       "",
+	}
+
+	func() {
+		kv.mu.Lock()
+		defer kv.mu.Unlock()
+
+		kv.opMap[newOp.Index] = &newOpCtx
+	}()
+
+	defer func() {
+		kv.mu.Lock()
+		defer kv.mu.Unlock()
+		delete(kv.opMap, newOp.Index)
+	}()
+
+	<-newOpCtx.notify
+	if newOpCtx.wrongLeader {
+		reply.Err = ErrWrongLeader
+		return
+	} else {
+		reply.Err = OK
+		DPrintf("Server: KVServer[%d] PutAppend(%s, %s) Done", kv.me, args.Key, args.Value)
+		return
+	}
+
+}
+
+// Read Applied Msg from Raft
+func (kv *KVServer) applyLoop() {
+	for !kv.killed() {
+		msg := <-kv.applyCh
+		cmd := msg.Command
+		index := msg.CommandIndex
+		term := msg.CommandTerm
+		op := cmd.(Op)
+
+		func() {
+			kv.mu.Lock()
+			defer kv.mu.Unlock()
+
+			opCtx, existOp := kv.opMap[index]
+			DPrintf("Server: KVServer[%d] Op: %v Exist: %v Cmd: %v, Index: %v, Term: %v", kv.me, opCtx, existOp, op, index, term)
+
+			if existOp {
+				if opCtx.op.Term != term || opCtx.op.Index != index {
+					opCtx.wrongLeader = true
+					return
+				}
+			}
+
+			DPrintf("Server: KVServer[%d] Leadership not change", kv.me)
+
+			switch op.Name {
+			case "Put":
+				kv.dbMap[op.Key] = op.Value
+			case "Append":
+				if _, ok := kv.dbMap[op.Key]; !ok {
+					kv.dbMap[op.Key] = op.Value
+				} else {
+					kv.dbMap[op.Key] += op.Value
+				}
+			case "Get":
+				if _, ok := kv.dbMap[op.Key]; !ok {
+					kv.dbMap[op.Key] = ""
+					if existOp {
+						opCtx.keyExist = false
+					}
+				} else {
+					if existOp {
+						opCtx.keyExist = true
+						opCtx.value = kv.dbMap[op.Key]
+					}
+				}
+			}
+
+			DPrintf("Server: KVServer[%d] Apply Command: %v", kv.me, op)
+
+			// notify the waiting RPC handler
+			if existOp {
+				close(opCtx.notify)
+			}
+		}()
+	}
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -92,6 +271,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+
+	kv.dbMap = make(map[string]string)
+	kv.opMap = make(map[int]*OpContext)
+
+	go kv.applyLoop()
 
 	return kv
 }

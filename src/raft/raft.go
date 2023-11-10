@@ -52,6 +52,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm  int
 
 	// For 2D:
 	SnapshotValid bool
@@ -549,6 +550,14 @@ func (rf *Raft) toLeader() {
 	rf.state = Leader
 }
 
+func (rf *Raft) HasLeader() bool {
+	return rf.leaderId != -1
+}
+
+func (rf *Raft) GetLeader() int {
+	return rf.leaderId
+}
+
 func (rf *Raft) appendEntriesLoop() {
 	for !rf.killed() {
 		time.Sleep(20 * time.Millisecond)
@@ -592,7 +601,7 @@ func (rf *Raft) appendEntriesLoop() {
 						rf.mu.Lock()
 						defer rf.mu.Unlock()
 						defer func() {
-							DPrintf("RaftNode[%d] appendEntries ends,  currentTerm[%d]  peer[%d] logIndex=[%d] nextIndex[%d] matchIndex[%d] commitIndex[%d] argsLogLen[%d]",
+							DPrintf("RaftNode[%d] AppendEntries ends, currentTerm[%d]  peer[%d] logIndex=[%d] nextIndex[%d] matchIndex[%d] commitIndex[%d] argsLogLen[%d]",
 								rf.me, rf.currentTerm, id, len(rf.logEntries), rf.nextInds[id], rf.matchInds[id], rf.commitIndex, len(aeArgs.Entries))
 						}()
 						// term change
@@ -655,7 +664,7 @@ func (rf *Raft) applyLogLoop() {
 	for !rf.killed() {
 		time.Sleep(10 * time.Millisecond)
 
-		func() {
+		func() {			
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
 
@@ -665,6 +674,7 @@ func (rf *Raft) applyLogLoop() {
 					CommandValid: true,
 					Command:      rf.logEntries[rf.lastApplied-1].Command,
 					CommandIndex: rf.lastApplied,
+					CommandTerm:  rf.logEntries[rf.lastApplied-1].Term,
 				}
 				rf.applyCh <- appliedMsg
 				DPrintf("RaftNode[%d] applyLog, currentTerm[%d] lastApplied[%d] commitIndex[%d]", rf.me, rf.currentTerm, rf.lastApplied, rf.commitIndex)
