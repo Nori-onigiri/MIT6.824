@@ -550,11 +550,9 @@ func (rf *Raft) toLeader() {
 	rf.state = Leader
 }
 
-func (rf *Raft) HasLeader() bool {
-	return rf.leaderId != -1
-}
-
 func (rf *Raft) GetLeader() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	return rf.leaderId
 }
 

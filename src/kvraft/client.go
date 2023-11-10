@@ -3,6 +3,7 @@ package kvraft
 import (
 	"crypto/rand"
 	"math/big"
+	"sync/atomic"
 	"time"
 
 	"6.5840/labrpc"
@@ -11,7 +12,9 @@ import (
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
-	leaderId int
+	leaderId int   // The leaderId of the cluster
+	clientId int64 // The clientId of the client
+	seqId    int64 // The sequence number of the request
 }
 
 func nrand() int64 {
@@ -25,6 +28,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.clientId = nrand()
 	return ck
 }
 
@@ -44,12 +48,18 @@ func (ck *Clerk) changeLeaderId() {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
+	args := GetArgs{
+		Key:      key,
+		ClientId: ck.clientId,
+		SeqId:    atomic.AddInt64(&ck.seqId, 1),
+	}
 	for {
 		DPrintf("Client: KVServer[%d] Get(%s)", ck.leaderId, key)
-		args := GetArgs{Key: key}
 		reply := GetReply{}
 		ok := ck.servers[ck.leaderId].Call("KVServer.Get", &args, &reply)
 		if !ok {
+			ck.changeLeaderId()
+			time.Sleep(1 * time.Millisecond)
 			continue
 		}
 		// Send RPC to server successfully, need to wait for response
@@ -63,7 +73,7 @@ func (ck *Clerk) Get(key string) string {
 		case ErrWrongLeader:
 			DPrintf("Client: KVServer[%d] Not Leader", ck.leaderId)
 			ck.changeLeaderId()
-			time.Sleep(5 * time.Millisecond)
+			time.Sleep(1 * time.Millisecond)
 			continue
 		}
 	}
@@ -79,12 +89,20 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	args := PutAppendArgs{
+		Key:      key,
+		Value:    value,
+		Op:       op,
+		ClientId: ck.clientId,
+		SeqId:    atomic.AddInt64(&ck.seqId, 1),
+	}
 	for {
 		DPrintf("Client: KVServer[%d] PutAppend(%s, %s)", ck.leaderId, key, value)
-		args := PutAppendArgs{Key: key, Value: value, Op: op}
 		reply := PutAppendReply{}
 		ok := ck.servers[ck.leaderId].Call("KVServer.PutAppend", &args, &reply)
 		if !ok {
+			ck.changeLeaderId()
+			time.Sleep(1 * time.Millisecond)
 			continue
 		}
 		switch reply.Err {
@@ -94,7 +112,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		case ErrWrongLeader:
 			DPrintf("Client: KVServer[%d] Not Leader", ck.leaderId)
 			ck.changeLeaderId()
-			time.Sleep(5 * time.Millisecond)
+			time.Sleep(1 * time.Millisecond)
 			continue
 		}
 	}
