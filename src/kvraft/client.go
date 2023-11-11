@@ -1,13 +1,20 @@
 package kvraft
 
-import "6.5840/labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"math/big"
+	"sync/atomic"
+	"time"
 
+	"6.5840/labrpc"
+)
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	leaderId int   // The leaderId of the cluster
+	clientId int64 // The clientId of the client
+	seqId    int64 // The sequence number of the request
 }
 
 func nrand() int64 {
@@ -21,7 +28,12 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.clientId = nrand()
 	return ck
+}
+
+func (ck *Clerk) changeLeaderId() {
+	ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
 }
 
 // fetch the current value for a key.
@@ -35,9 +47,36 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) string {
-
 	// You will have to modify this function.
-	return ""
+	args := GetArgs{
+		Key:      key,
+		ClientId: ck.clientId,
+		SeqId:    atomic.AddInt64(&ck.seqId, 1),
+	}
+	for {
+		DPrintf("Client: KVServer[%d] Get(%s)", ck.leaderId, key)
+		reply := GetReply{}
+		ok := ck.servers[ck.leaderId].Call("KVServer.Get", &args, &reply)
+		if !ok {
+			ck.changeLeaderId()
+			time.Sleep(1 * time.Millisecond)
+			continue
+		}
+		// Send RPC to server successfully, need to wait for response
+		switch reply.Err {
+		case OK:
+			DPrintf("Client: KVServer[%d] Get(%s) = %s", ck.leaderId, key, reply.Value)
+			return reply.Value
+		case ErrNoKey:
+			DPrintf("Client: KVServer[%d] Get(%s) = None", ck.leaderId, key)
+			return ""
+		case ErrWrongLeader:
+			DPrintf("Client: KVServer[%d] Not Leader", ck.leaderId)
+			ck.changeLeaderId()
+			time.Sleep(1 * time.Millisecond)
+			continue
+		}
+	}
 }
 
 // shared by Put and Append.
@@ -50,6 +89,33 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	args := PutAppendArgs{
+		Key:      key,
+		Value:    value,
+		Op:       op,
+		ClientId: ck.clientId,
+		SeqId:    atomic.AddInt64(&ck.seqId, 1),
+	}
+	for {
+		DPrintf("Client: KVServer[%d] PutAppend(%s, %s)", ck.leaderId, key, value)
+		reply := PutAppendReply{}
+		ok := ck.servers[ck.leaderId].Call("KVServer.PutAppend", &args, &reply)
+		if !ok {
+			ck.changeLeaderId()
+			time.Sleep(1 * time.Millisecond)
+			continue
+		}
+		switch reply.Err {
+		case OK:
+			DPrintf("Client: KVServer[%d] PutAppend(%s, %s) = OK", ck.leaderId, key, value)
+			return
+		case ErrWrongLeader:
+			DPrintf("Client: KVServer[%d] Not Leader", ck.leaderId)
+			ck.changeLeaderId()
+			time.Sleep(1 * time.Millisecond)
+			continue
+		}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
